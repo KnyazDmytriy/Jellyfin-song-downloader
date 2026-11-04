@@ -7,6 +7,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,12 @@ MUSIC_ROOT.mkdir(parents=True, exist_ok=True)
 STAGING_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="YouTube to Jellyfin Music Ingest")
+
+# Background download jobs: job_id -> {status, url, dir, total, tracks, staged, error, created}.
+# Downloads run in daemon threads so POST /api/download can return immediately
+# (Cloudflare kills proxied requests idle ~100s; an 18-track playlist takes minutes).
+_jobs: dict[str, dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
 
 INVALID_CHARS = re.compile(r'[\\/:*?"<>|]')
 SPACE_RE = re.compile(r"\s+")
@@ -134,13 +142,13 @@ def probe(request: URLRequest) -> dict[str, Any]:
     return {"type": "playlist" if info.get("_type") == "playlist" or len(tracks) > 1 else "single", "tracks": tracks}
 
 
-@app.post("/api/download")
-def download(request: URLRequest) -> dict[str, Any]:
-    job_id = uuid.uuid4().hex[:12]
-    job_dir = STAGING_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
+def _run_download(job_id: str, url: str, entries: list[dict[str, Any]]) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        job_dir = Path(job["dir"])
     try:
-        info = extract_info(request.url)
         command = yt_dlp_command() + [
             "-f", "bestaudio/best",
             "--extract-audio",
@@ -150,17 +158,23 @@ def download(request: URLRequest) -> dict[str, Any]:
             "--convert-thumbnails", "jpg",
             "--no-warnings",
             "-o", str(job_dir / "%(autonumber)02d-%(id)s.%(ext)s"),
-            request.url,
+            url,
         ]
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode:
             raise RuntimeError((result.stderr or result.stdout).strip())
     except FileNotFoundError as exc:
-        raise HTTPException(400, "ffmpeg is missing. Install it with: brew install ffmpeg") from exc
-    except Exception as exc:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["error"] = "ffmpeg is missing inside the container"
         shutil.rmtree(job_dir, ignore_errors=True)
-        raise HTTPException(400, f"Download failed: {exc}") from exc
-    entries = info.get("entries") or [info]
+        return
+    except Exception as exc:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["error"] = f"Download failed: {exc}"
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return
     staged: list[dict[str, Any]] = []
     audio_files = sorted(job_dir.glob("*.m4a"))
     for index, entry in enumerate(entries):
@@ -170,7 +184,96 @@ def download(request: URLRequest) -> dict[str, Any]:
         metadata = {**track, "staging_id": f"{job_id}:{audio_files[index].name}", "audio": audio_files[index].name}
         (audio_files[index].with_suffix(".json")).write_text(json.dumps(metadata), encoding="utf-8")
         staged.append({"staging_id": metadata["staging_id"], "yt_id": track["yt_id"], "title": track["title"], "thumb_path": track["thumb"]})
-    return {"staged": staged}
+    with _jobs_lock:
+        if not staged:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["error"] = "No audio tracks were produced."
+            return
+        _jobs[job_id]["status"] = "done"
+        _jobs[job_id]["staged"] = staged
+
+
+@app.post("/api/download")
+def download(request: URLRequest) -> dict[str, Any]:
+    # Probe synchronously (fast, seconds) so the frontend gets track titles
+    # and total immediately; the slow yt-dlp download runs in background.
+    try:
+        info = extract_info(request.url)
+    except Exception as exc:
+        raise HTTPException(400, f"Could not probe link: {exc}") from exc
+    entries = [entry for entry in (info.get("entries") or [info]) if entry]
+    if not entries:
+        raise HTTPException(400, "No tracks found at that link")
+    tracks = [track_from_info(entry) for entry in entries]
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = STAGING_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "status": "running",
+            "url": request.url,
+            "dir": str(job_dir),
+            "total": len(tracks),
+            "tracks": tracks,
+            "staged": [],
+            "error": "",
+            "created": time.time(),
+        }
+    thread = threading.Thread(target=_run_download, args=(job_id, request.url, entries), daemon=True)
+    thread.start()
+    return {"job_id": job_id, "total": len(tracks), "tracks": tracks}
+
+
+@app.get("/api/job/{job_id}")
+def job_status(job_id: str) -> dict[str, Any]:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            # Fall back to disk so a server restart doesn't orphan staged files:
+            # if the job dir exists with metadata, report it as done.
+            job_dir = STAGING_DIR / job_id
+            if job_dir.is_dir():
+                staged = []
+                for meta_path in sorted(job_dir.glob("*.json")):
+                    try:
+                        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    staged.append({"staging_id": meta.get("staging_id", f"{job_id}:{meta_path.with_suffix('.m4a').name}"), "yt_id": meta.get("yt_id", ""), "title": meta.get("title", meta_path.stem), "thumb_path": meta.get("thumb", "")})
+                if staged:
+                    return {"job_id": job_id, "status": "done", "total": len(staged), "done": len(staged), "staged": staged, "tracks": [], "error": ""}
+            raise HTTPException(404, "Unknown job id")
+        status = job["status"]
+        total = job["total"]
+        staged = list(job["staged"])
+        tracks = list(job["tracks"])
+        error = job["error"]
+        job_dir = Path(job["dir"])
+    done_count = len(list(job_dir.glob("*.m4a"))) if job_dir.is_dir() else 0
+    return {"job_id": job_id, "status": status, "total": total, "done": done_count if status == "running" else len(staged), "staged": staged if status == "done" else [], "tracks": tracks, "error": error}
+
+
+@app.get("/api/staging")
+def list_staging() -> dict[str, Any]:
+    # Resumable sessions: every job dir on disk with metadata JSON.
+    sessions = []
+    for job_dir in sorted(STAGING_DIR.iterdir()):
+        if not job_dir.is_dir():
+            continue
+        metas = sorted(job_dir.glob("*.json"))
+        if not metas:
+            continue
+        tracks = []
+        for meta_path in metas:
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            tracks.append({"staging_id": meta.get("staging_id", f"{job_dir.name}:{meta_path.with_suffix('.m4a').name}"), "yt_id": meta.get("yt_id", ""), "title": meta.get("title", meta_path.stem)})
+        sessions.append({"job_id": job_dir.name, "total": len(tracks), "tracks": tracks})
+    with _jobs_lock:
+        live = {jid: {"status": j["status"], "total": j["total"]} for jid, j in _jobs.items()}
+    return {"sessions": sessions, "jobs": live}
 
 
 @app.post("/api/suggest")

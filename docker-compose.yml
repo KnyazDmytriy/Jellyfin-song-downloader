@@ -1,0 +1,14 @@
+services:
+  song-downloader:
+    build: .
+    container_name: song-downloader
+    # Same owner as the Jellyfin media files (avoids permission issues)
+    user: "1000:1000"
+    ports:
+      - "8099:8099"
+    volumes:
+      # Mounted at the same path inside the container, so .env works as-is
+      - /home/aragorn/jellyfin/media/Music/structured-music:/home/aragorn/jellyfin/media/Music/structured-music
+      - /home/aragorn/jellyfin/media/Music/staging:/home/aragorn/jellyfin/media/Music/staging
+    env_file: .env
+    restart: unless-stopped
